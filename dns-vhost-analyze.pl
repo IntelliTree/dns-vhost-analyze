@@ -4,12 +4,11 @@ use strict;
 use warnings;
 use lib '/opt/sbl/scripts/include';
 use Try::Tiny;
-use Log::Any '$log';
-use Log::Any::Adapter;
 use Getopt::Long;
 use Pod::Usage 'pod2usage';
 use Socket 'inet_ntoa';
 use Data::Dump 'dump';
+use JSON;
 
 =head1 NAME
 
@@ -17,26 +16,27 @@ vhost-dns-analyze.pl - analyze DNS vs whois, apache2 vhosts vs DNS, or both
 
 =head1 SYNOPSIS
 
-vhost-dns-analyze.pl --dns=SOURCE > output_table.tsv
-vhost-dns-analyze.pl --dns=SOURCE --dump-dns > dns_entries.tsv
-vhost-dns-analyze.pl --vhost=SOURCE > output_table.tsv
-vhost-dns-analyze.pl --vhost=SOURCE --dump-vhost > vhost_entries.tsv
+# standard usage
 vhost-dns-analyze.pl --dns=SOURCE --vhost=SOURCE > combined_output.tsv
+
+# or collect it from different computers (ie NS1 and Webserver)
+vhost-dns-analyze.pl --dns=SOURCE --dump-dns=dns_entries.tsv
+vhost-dns-analyze.pl --vhost=SOURCE --dump-vhost=vhost_entries.tsv
+
 
  Option Summary:
    --help              brief help
    --man               full documentation
    --dns mydns         check dns entries from "dbi:mysql:host=localhost;database=mydns:rr"
    --dns dbi:DSN:TABLE check dns entries from compatible table (dbi:mysql:param1;..paramN;:TABLE)
-   --dns data:FILENAME check dns entries from previously dumped TSV file
-   --dump-dns          print DNS entries instead of analyzing anything
+   --dns json:FILENAME check dns entries from previously dumped TSV file
+   --expected-ns LIST  set list of expected nameservers for the DNS records
+   --dump-dns FILE     writes DNS entries to FILE as json
    --vhost apache2     check virtual hosts from "/etc/apache2/httpd.conf"
-   --vhost cfg:FILE    check virtual hosts from alternate paache configfile
-   --vhost data:FILE   check virtual hosts from previously dumped vhost data
-   --dump-vhosts       print virtual hosts data instead of analyzing anything
-   --whois-src HOST    use HOST for all live whois requests
-   --dns-src HOST      use HOST for all live DNS queries
-   --whois-cache FILE  use FILE for caching whois requests. created if needed.
+   --vhost cfg:FILE    check virtual hosts from alternate apache configfile
+   --vhost json:FILE   check virtual hosts from previously dumped vhost data
+   --expected-ip LIST  set list of expected public IP addrs for the vhosts
+   --dump-vhost FILE   print virtual hosts to FILE as json
 
 =head1 CHANGELOG
 
@@ -44,7 +44,8 @@ vhost-dns-analyze.pl --dns=SOURCE --vhost=SOURCE > combined_output.tsv
 
 =item 0.01 - 2013-11-29, MLC
 
-Initial version, scans zone table and runs whois on each entry
+Initial version, scans soa table and apache configs and does name lookups on them
+Dropped original "whois" strategy in favor of "dig +trace".
 
 =cut
 
@@ -53,93 +54,84 @@ our $VERSION= '0.01';
 my @dns_source;
 my @vhost_source;
 my ($dump_dns, $dump_vhost);
-my ($whois_server, $dns_server, $whois_cache_file);
-my ($cur_nameserver, $cur_webaddr)= ('ns1.intellitree.com', 'neutrino.intree.net');
+my (@expected_nameservers, @expected_webaddrs);
 my $hide_duplicate_rows;
-my $apache_opts= '-D DEFAULT_VHOST -D PHP5 -D SVN -D DAV -D DAV_FS -D AUTH_PAM -D SSL -D SSL_DEFAULT_VHOST -D PROXY -D PROXY_HTML -D FASTCGI -D NO_DETACH';
-my %whois_cache;
 my %dns_cache;
+my %ns_cache;
 
 GetOptions (
 	'help|?'              => sub { pod2usage(1); },
 	'man'                 => sub { pod2usage(-exitval => 1, -verbose => 2); },
 	'dns=s'               => sub { push @dns_source, $_[1] },
 	'vhost=s'             => sub { push @vhost_source, $_[1] },
-	'dump-dns'            => \$dump_dns,
-	'dump-vhost'          => \$dump_vhost,
-	'apache-opts=s'       => \$apache_opts,
-	'whois-server=s'      => \$whois_server,
-	'dns-server=s'        => \$dns_server,
-	'whois-cache=s'       => \$whois_cache_file,
-	'hide-duplicate-rows' => \$hide_duplicate_rows,
+	'dump-dns=s'          => \$dump_dns,
+	'dump-vhost=s'        => \$dump_vhost,
+	'expected-ns=s'       => sub { push @expected_nameservers, split(',', $_[1]) },
+	'expected-ip=s'       => sub { push @expected_webaddrs, split(',', $_[1]) },
 ) or pod2usage();
 
 @dns_source or @vhost_source
 	or die "Require at least one --dns or --vhost option\n";
+@expected_nameservers= ('ns1.intellitree.com', 'ns2.intellitree.com')
+	unless @expected_nameservers;
+@expected_webaddrs= map { ($_ =~ /^(10\.|172\.(16|17|18|19|2\d|30|31)\.|192\.168\.|127\.|169\.254\.)/)? () : ($_) } (`ifconfig -a` =~ /inet addr:(\S+)/g)
+	unless @expected_webaddrs;
+
 exit run();
 
 sub run {
 	my @dns_data;
 	my @vhost_data;
 	
-	if ($whois_cache_file) {
-		if (-f $whois_cache_file) {
-			open(my $fd, '<', $whois_cache_file) or die "open($whois_cache_file): $!";
-			while (<$fd>) {
-				chomp($_);
-				my ($k, @v)= map { lc($_) } split "\t", $_;
-				#print STDERR "$k => (".@v.') '.join(', ', @v)."\n";
-				$whois_cache{$k}= \@v
-					if defined $k and length $k;
-			}
-		} else {
-			open(my $fd, '+>', $whois_cache_file) or die "open($whois_cache_file): $!";
-		}
-	}
-
+	# Collect list of all dns to check from specified sources
 	for my $dns_src (@dns_source) {
 		if ($dns_src eq 'mydns') {
 			my $home= $ENV{HOME} || '/root';
 			dns_merge(\@dns_data, dns_load_dbi("dbi:mysql:mysql_read_default_file=$home/.my.cnf;host=localhost;database=mydns", 'soa'));
 		} elsif ($dns_src =~ /^(dbi.*):([^:]+)$/) {
 			dns_merge(\@dns_data, dns_load_dbi($1, $2));
-		} elsif ($dns_src =~ /^data:(.*)$/) {
-			dns_merge(\@dns_data, dns_load_tsv($1));
+		} elsif ($dns_src =~ /^json:(.*)$/) {
+			dns_merge(\@dns_data, dns_import($1));
 		} else {
 			die "Unrecognized spec for dns data: \"$dns_src\"\n";
 		}
 	}
 
+	# Collect all vhost to check from specified sources
 	for my $vhost_src (@vhost_source) {
 		if ($vhost_src eq 'apache2') {
 			vhost_merge(\@vhost_data, vhost_load_apachecfg('/etc/apache2/httpd.conf'));
 		} elsif ($vhost_src =~ /^cfg:(.*)$/) {
 			vhost_merge(\@vhost_data, vhost_load_apachecfg($1));
-		} elsif ($vhost_src =~ /^data:(.*)$/) {
-			vhost_merge(\@vhost_data, vhost_load_tsv($1));
+		} elsif ($vhost_src =~ /^json:(.*)$/) {
+			vhost_merge(\@vhost_data, vhost_import($1));
 		} else {
 			die "Unrecognized spec for vhost data: \"$vhost_src\"\n";
 		}
 	}
 	
-	if ($dump_vhost) {
-		vhost_save_tsv(\@vhost_data, \*STDOUT);
-	} elsif ($dump_dns) {
-		dns_save_tsv(\@dns_data, \*STDOUT);
-	} else {
-		my $result= analyze(\@dns_data, \@vhost_data);
-		print_analysis($result);
-		return 1 if $result->{err};
-	}
+	# Save copies of vhost and dns items if user requested it
+	vhost_export(\@vhost_data, $dump_vhost)
+		if defined $dump_vhost;
+	dns_export(\@dns_data, $dump_dns)
+		if defined $dump_dns;
+	
+	# Analyze the items
+	my $result= analyze(\@dns_data, \@vhost_data);
+	
+	# Display results as tsv
+	print_analysis($result);
+	
+	# Success if and only if all lookups matched expectations
+	return 1 if $result->{err};
 	return 0;
 }
 
+# Merge two arrays of dns-check data.  This is only necessary because I
+# wanted to store them as arrays.  (they were originally tables)
 sub dns_merge {
 	my ($table1, $table2)= @_;
-	# Merge table2 into table1.
-	# Assume table1 is sane.
 	# Die on conflicting rows, treating domain as primary key.
-	# Table format: ( domain, nameserver )
 	my $i= 0;
 	my %by_domain= map { $_->{domain} => $i++ } @$table1;
 	for my $rec (@$table2) {
@@ -158,60 +150,46 @@ sub dns_merge {
 	$table1;
 }
 
+# Load dns names from specified DB/table/column
 sub dns_load_dbi {
-	my ($dsn, $table)= @_;
-	$cur_nameserver =~ /^[\d\.]+$/
-		or $cur_nameserver= dns_resolve($cur_nameserver);
+	my ($dsn, $table, $column)= @_;
 	require DBI;
 	my $db= DBI->connect($dsn, undef, undef, { RaiseError => 1, AutoCommit => 1 })
 		or die "DBI should have thrown an error";
-	my $rows= $db->selectall_arrayref('SELECT origin FROM '.$db->quote_identifier($table), { Slice => [0] });
+	my $rows= $db->selectall_arrayref(
+		'SELECT '.$db->quote_identifier($column)
+		.' FROM '.$db->quote_identifier($table),
+		{ Slice => [0] }
+	);
+	# For each row, build a record of domain-name and expected nameservers
 	for (@$rows) {
 		my $d= lc($_->[0]);
 		$d =~ s/\.$//;
-		$_= { domain => $d, nameserver => $cur_nameserver };
+		$_= { domain => $d, nameserver => \@expected_nameservers };
 	}
 	$rows;
 }
 
-sub dns_load_tsv {
+sub dns_import {
 	my ($file)= @_;
-	my $table= [];
-	open(my $fh, "<", $file) or die "open($file): $!";
-	<$fh> eq "DOMAIN\tNAMESERVER\n"
-		or die "dns tsv file has wrong header\n";
-	while (<$fh>) {
-		my %row;
-		chomp($_);
-		@row{'domain','nameserver'}= split '\t', $_;
-		push @$table, \%row;
-	}
+	open(my $fd, "<", $file) or die "open($file): $!";
+	local $/= undef;
+	my $table= decode_json(<$fd>);
 	$table;
 }
 
-sub dns_save_tsv {
-	my ($table, $fd)= @_;
-	print "DOMAIN\tNAMESERVER\n";
-	print $fd join("\t", @{$_}{'domain','nameserver'})."\n"
-		for @$table;
+sub dns_export {
+	my ($table, $file)= @_;
+	open(my $fd, ">", $file) or die "open($file): $!";
+	print $fd encode_json($table)."\n";
+	close $fd or die "close($file): $!";
 }
 
-sub apache_dump_vhosts {
-	my ($apache_opts)= @_;
-	my $out= `apache2 $apache_opts -D DUMP_VHOSTS -t`;
-	$out =~ /^Syntax OK$/m
-		or die "Can't dump apache options, or configuration syntax error:\n\n$out\n";
-	#$out =~ 
-	# nevermind
-	...
-}
-
+# Merge two arrays of vhost-check data.  This is only necessary because I
+# wanted to store them as arrays.  (they were originally tables)
 sub vhost_merge {
 	my ($table1, $table2)= @_;
-	# Merge table2 into table1.
-	# Assume table1 is sane.
 	# die on conflicting rows, treating hostname as primary key.
-	# table format: ( hostname, server, site_id )
 	my $i= 0;
 	my %by_name= map { $_->[0] => $i++ } @$table1;
 	for my $rec (@$table2) {
@@ -226,13 +204,12 @@ sub vhost_merge {
 			$by_name{$hostname}= $i++;
 		}
 	}
+	$table1;
 }
 
-# Rudimentary parsing of apache config.  Not intended to be complete
+# Rudimentary parsing of apache config.  Not intended to be perfect
 sub vhost_load_apachecfg {
 	my ($fname)= @_;
-	$cur_webaddr =~ /^[\d\.]+$/
-		or $cur_webaddr= dns_resolve($cur_webaddr);
 	my @worklist= ($fname);
 	my %seen= ($fname => 1);
 	my %hostnames;
@@ -241,7 +218,7 @@ sub vhost_load_apachecfg {
 		my $cfg_txt= do { open(my $fh, "<", $f) or die "Can't open $f: $!"; local $/= undef; <$fh> };
 		for ($cfg_txt =~ /^\s*Server(?:Name|Alias)\s+(\S+)/mg) {
 			next unless $_ =~ /\.\D/;
-			$hostnames{$_}= { hostname => lc($_), server => $cur_webaddr, cfg_file => $f };
+			$hostnames{$_}= { hostname => lc($_), server => \@expected_webaddrs, cfg_file => $f };
 		}
 		push @worklist, grep { !$seen{$_}++ }
 			map { index($_, '*') >= 0 ? eval "<$_>" : ($_) }
@@ -250,70 +227,87 @@ sub vhost_load_apachecfg {
 	[ values %hostnames ];
 }
 
-sub vhost_load_tsv {
+sub vhost_import {
 	my ($file)= @_;
-	my $table= [];
-	open(my $fh, "<", $file) or die "open($file): $!";
-	<$fh> eq "HOSTNAME\tSERVER\tCFG_FILE\n"
-		or die "vhost tsv file has wrong header\n";
-	while (<$fh>) {
-		chomp($_);
-		my %row;
-		@row{'hostname','server','cfg_file'}= split '\t', $_;
-		push @$table, \%row;
-	}
+	open(my $fd, "<", $file) or die "open($file): $!";
+	local $/= undef;
+	my $table= decode_json(<$fd>);
 	$table;
 }
 
-sub vhost_save_tsv {
-	my ($table, $fd)= @_;
-	print $fd "HOSTNAME\tSERVER\tCFG_FILE\n";
-	print $fd join("\t", @{$_}{'hostname','server','cfg_file'})."\n"
-		for @$table;
+sub vhost_export {
+	my ($table, $file)= @_;
+	open(my $fd, ">", $file) or die "open($file): $!";
+	print $fd encode_json($table)."\n";
+	close $fd or die "close($file): $!";
 }
 
+# Simple dns resolve, using gethostbyname
+# Fails with string "(unresolvable)"
 sub dns_resolve {
 	my ($host)= @_;
 	$host= lc($host);
 	return $dns_cache{$host}
 		if exists $dns_cache{$host};
-	print STDERR "Resolving $host\n";
 	my $ip= gethostbyname($host)
 		or do { warn "gethostbyname($host): $!"; return '(unresolvable)'; };
-	return ($dns_cache{$host}= inet_ntoa($ip));
+	$ip= $dns_cache{$host}= inet_ntoa($ip);
+	print STDERR "Resolved $host as $ip\n";
+	return $ip;
 }
 
-sub whois_resolve {
+# Resolve nameservers for $domain.  Be smart, and travel the nameserver
+# hierarchy, instead of trusting the NS records of the leaf server.
+sub ns_resolve {
 	my ($domain)= @_;
 	$domain= lc($domain);
-	#print STDERR "domain = $domain, whois_cache{$domain} = $whois_cache{$domain}\n";
-	return [ @{$whois_cache{$domain}} ]
-		if exists $whois_cache{$domain};
-	my $cust_server= defined $whois_server? "-h $whois_server" : "";
-	my $tries= 3;
+	return [ @{$ns_cache{$domain}} ]
+		if exists $ns_cache{$domain};
+	my @ns;
+	my @out;
+	my $tries= 5;
+	my $wstat;
 	while ($tries--) {
-		my $out= `whois $cust_server $domain`;
-		my @ips= map { lc($_) } ($out =~ /Name Server[^a-zA-Z0-9_\n\r]+(\S+)/mg);
-		if ($? != 0) {
-			print STDERR "whois error: $out\n";
-			sleep 2;
-		} else {
-			# Look for explicit no-match
-			die "Unrecognized output from whois: $out\n"
-				unless @ips || ($out =~ /^\s*no match/i);
-			print STDERR "whois $domain => ".join(', ', @ips)."\n";
-			$whois_cache{$domain}= \@ips;
-			if ($whois_cache_file) {
-				open(my $fd, ">>", $whois_cache_file) or die "open($whois_cache_file): $!";
-				print $fd join("\t", $domain, @ips)."\n";
-				close($fd);
-			}
-			return [ @ips ];
+		# dig +trace to query nameservers in sequence from root to leaf.
+		@out= `dig +trace +authority +additional -t NS $domain`;
+		# dig might fail because it can't reach the final nameserver,
+		# but we don't care.  Try parsing it anyway and continue if we
+		# get our NS records from the parent server.
+		$wstat= $?;
+		my $done= 0;
+		for (@out) {
+			# The NS records we want are the very first ones which refer to $domain,
+			# which should be reported by the parent of the leaf nameserver.
+			push @ns, $1
+				if !$done and index($_, $domain) == 0 and ($_ =~ /NS\s+(\S+)\.\s*$/);
+			# Once we collect NS records from the parent, ignore everything from the leaf itself.
+			$done= 1
+				if @ns && ($_ =~ /^;;/);
+			# While we're at it, stuff any A records we find into the dns_cache.
+			$dns_cache{$1}= $2
+				if $_ =~ /^(\w+\S+)\.\s+\S+\s+\S+\s+A\s+(\d\S+)\s*$/;
 		}
+		# If we got our NS records, or if dig exited cleanly, return results.
+		last if @ns || ($wstat == 0);
+		# Else wait and try again in case temporary failure
+		print STDERR "trouble looking up $domain\n@out\n";
+		sleep 2;
 	}
-	return [];
+	print STDERR "Resolved NS for $domain as (@ns)\n";
+	\@ns;
 }
 
+# Compares 2 lists for whether they have an element in common.
+# Would be more efficient here if we had kept them as hashes all along.
+sub _has_element_in_common {
+	my ($list1, $list2)= @_;
+	my %x= map { $_ => 1 } @$list1;
+	$x{$_} and return 1
+		for @$list2;
+	return 0;
+}
+
+# Perform real-world lookups on the DNS and vhost data
 sub analyze {
 	my ($dns_data, $vhost_data)= @_;
 	my %result= (
@@ -325,16 +319,19 @@ sub analyze {
 	);
 	for my $rec (@$dns_data) {
 		my $d= $rec->{domain};
-		my $whois= whois_resolve($d);
+		my $whois= ns_resolve($d);
 		my $whois_ip= [ map { dns_resolve($_) } @$whois ];
+		my $expected= $rec->{nameserver} || [];
+		my $expected_ip= [ map { dns_resolve($_) } @$expected ];
 		# strip trailing dot
 		$d =~ s/\.$//;
 		#print STDERR "$d ( @$whois_ip ) expect $ip\n";
 		$result{domains}{$d}= {
-			dns_ip          => $rec->{nameserver} || '',
-			dns_official    => $whois,
-			dns_official_ip => $whois_ip,
-			dns_correct     => !!(grep { $rec->{nameserver} eq $_ } @$whois_ip),
+			dns_expected    => $expected,
+			dns_expected_ip => $expected_ip,
+			dns_actual      => $whois,
+			dns_actual_ip   => $whois_ip,
+			dns_correct     => _has_element_in_common( $expected_ip, $whois_ip ),
 		};
 		$result{err_wrong_nameserver}= 1
 			unless $result{domains}{$d}{dns_correct};
@@ -344,15 +341,18 @@ sub analyze {
 		$host =~ /((?:[^.]+.)?[^.]+)$/
 			or die "Can't determine domain of hostname \"$host\"\n";
 		my $d= $1;
-		my $ip= $rec->{server};
-		my $actual= dns_resolve($host) || '';
+		my $expected= $rec->{server} || [];
+		my $expected_ip= [ map { dns_resolve($_) } @$expected ];
+		my $actual_ip= dns_resolve($host);
 		$result{hosts}{$host}= {
 			%$rec,
 			domain         => $1,
 			hostname       => $host,
-			expected_ip    => $ip,
-			actual_ip      => $actual,
-			ip_correct     => $ip eq $actual,
+			expected       => $expected,
+			expected_ip    => $expected_ip,
+			actual         => $host||'',
+			actual_ip      => $actual_ip||'',
+			ip_correct     => _has_element_in_common( [ $actual_ip ], $expected_ip ),
 		};
 		$result{err_wrong_webserver}= 1
 			unless $result{hosts}{$host}{ip_correct};
@@ -361,6 +361,9 @@ sub analyze {
 	return \%result;
 }
 
+# Print the analysis as a side-by-side table of Nameserver lookup
+# and Vhost name lookup similar to an outer join, to make it easy
+# compare both kinds of records at once.
 sub print_analysis {
 	my ($analysis)= @_;
 	my $domains= $analysis->{domains};
@@ -376,7 +379,7 @@ sub print_analysis {
 		if ($domains->{$d}) {
 			$dns_correct= $domains->{$d}{dns_correct}? 'Y' : 'N';
 			$foreign_dns= $domains->{$d}{dns_correct}? '-'
-				: @{$domains->{$d}{dns_official}}? $domains->{$d}{dns_official}[0]
+				: @{$domains->{$d}{dns_actual}}? $domains->{$d}{dns_actual}[0]
 				: '(?)';
 		}
 		if ($all_by_domain{$d}{hosts}) {
